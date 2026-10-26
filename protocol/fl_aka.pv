@@ -1,0 +1,105 @@
+(* ===================================================================
+   FL-AKA v1: formal model for ProVerif 2.x
+   Run:  proverif protocol/fl_aka.pv
+
+   Threat model: Dolev-Yao attacker on a public channel, plus
+     - an insider: a registered but malicious client (idE) whose
+       private key and certificate the attacker holds;
+     - phase 1: long-term keys of the honest client and server are
+       leaked after the sessions, to test forward secrecy.
+   Timestamps are not modelled (ProVerif has no clock); freshness
+   comes from nonces and ephemeral Diffie-Hellman values.
+   =================================================================== *)
+
+free c: channel.
+
+type host.
+type skey.
+type pkey.
+type nonce.
+type key.
+type G.
+type exponent.
+
+free idC0, idS0, idE: host.
+free modelUpdate: bitstring [private].
+
+const tagM1, tagM2, tagS, tagC: bitstring [data].
+
+(* Signatures *)
+fun pk(skey): pkey.
+fun sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksign(sign(m, k), pk(k)) = m.
+
+(* Diffie-Hellman *)
+const g: G [data].
+fun exp(G, exponent): G.
+equation forall x: exponent, y: exponent; exp(exp(g, x), y) = exp(exp(g, y), x).
+
+(* Hash, KDF, MAC, symmetric encryption *)
+fun h(bitstring): bitstring.
+fun kdf(G, nonce, nonce, bitstring): key.
+fun mac(bitstring, key): bitstring.
+fun senc(bitstring, key): bitstring.
+reduc forall m: bitstring, k: key; sdec(senc(m, k), k) = m.
+
+(* Events *)
+event Crun(host, host, G, G).
+event Cend(host, host, G, G).
+event Srun(host, host, G, G).
+event Send(host, host, G, G).
+
+(* Queries *)
+query attacker(modelUpdate).
+query a: host, b: host, x: G, y: G;
+  inj-event(Send(a, b, x, y)) ==> inj-event(Crun(a, b, x, y)).
+query a: host, b: host, x: G, y: G;
+  inj-event(Cend(a, b, x, y)) ==> inj-event(Srun(a, b, x, y)).
+
+let Client(skC: skey, idC: host, certC: bitstring, pkRA: pkey, idS: host) =
+  new x: exponent;
+  let X = exp(g, x) in
+  new nC: nonce;
+  out(c, (idC, certC, X, nC, sign((tagM1, idC, idS, X, nC), skC)));
+  in(c, (idS2: host, certS: bitstring, Y: G, nS: nonce, sigS: bitstring, tauS: bitstring));
+  if idS2 = idS then
+  let (=idS, pkS: pkey) = checksign(certS, pkRA) in
+  let tr = h((idC, X, nC, idS, Y, nS)) in
+  if checksign(sigS, pkS) = (tagM2, tr) then
+  let k = kdf(exp(Y, x), nC, nS, tr) in
+  if tauS = mac((tagS, tr), k) then
+  event Cend(idC, idS, X, Y);
+  event Crun(idC, idS, X, Y);
+  out(c, mac((tagC, tr), k));
+  out(c, senc(modelUpdate, k)).
+
+let Server(skS: skey, idS: host, certS: bitstring, pkRA: pkey) =
+  in(c, (idC: host, certC: bitstring, X: G, nC: nonce, sigC: bitstring));
+  let (=idC, pkC: pkey) = checksign(certC, pkRA) in
+  if checksign(sigC, pkC) = (tagM1, idC, idS, X, nC) then
+  new y: exponent;
+  let Y = exp(g, y) in
+  new nS: nonce;
+  let tr = h((idC, X, nC, idS, Y, nS)) in
+  let k = kdf(exp(X, y), nC, nS, tr) in
+  event Srun(idC, idS, X, Y);
+  out(c, (idS, certS, Y, nS, sign((tagM2, tr), skS), mac((tagS, tr), k)));
+  in(c, tauC: bitstring);
+  if tauC = mac((tagC, tr), k) then
+  event Send(idC, idS, X, Y).
+
+process
+  new skRA: skey;
+  let pkRA = pk(skRA) in
+  new skC: skey;
+  new skS: skey;
+  new skE: skey;
+  let certC = sign((idC0, pk(skC)), skRA) in
+  let certS = sign((idS0, pk(skS)), skRA) in
+  let certE = sign((idE, pk(skE)), skRA) in
+  out(c, (pkRA, pk(skC), pk(skS), certC, certS, skE, certE));
+  (
+      (! Client(skC, idC0, certC, pkRA, idS0))
+    | (! Server(skS, idS0, certS, pkRA))
+    | (phase 1; out(c, (skC, skS)))
+  )
